@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::str;
 
 use winnow::prelude::*;
-use winnow::Result;
+use winnow::{ascii::{multispace0, till_line_ending}, combinator::opt, stream::AsChar, token::one_of, Result};
 use winnow::{
     ascii::float,
     combinator::empty,
@@ -12,7 +12,7 @@ use winnow::{
     combinator::{delimited, preceded, separated_pair, terminated},
     combinator::{repeat, separated},
     error::{AddContext, ParserError, StrContext},
-    token::{any, none_of, take, take_while},
+    token::{any, none_of, take},
 };
 
 use crate::json::JsonValue;
@@ -33,7 +33,7 @@ pub(crate) type Stream<'i> = &'i str;
 pub(crate) fn json<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>>(
     input: &mut Stream<'i>,
 ) -> Result<JsonValue, E> {
-    delimited(ws, json_value, ws).parse_next(input)
+    delimited(ws, json_value, (ws, opt(','), ws)).parse_next(input)
 }
 
 /// `alt` is a combinator that tries multiple parsers one by one, until
@@ -88,15 +88,13 @@ fn false_<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> Result<bool
 fn string<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>>(
     input: &mut Stream<'i>,
 ) -> Result<String, E> {
-    preceded(
+    delimited(
         '\"',
-        terminated(
-            repeat(0.., character).fold(String::new, |mut string, c| {
-                string.push(c);
-                string
-            }),
-            '\"',
-        ),
+        repeat(0.., character).fold(String::new, |mut string, c| {
+            string.push(c);
+            string
+        }),
+        '\"',
     )
     // `context` lets you add a static string to errors to provide more information in the
     // error chain (to indicate which parser had an error)
@@ -164,7 +162,7 @@ fn array<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>>(
 ) -> Result<Vec<JsonValue>, E> {
     preceded(
         ('[', ws),
-        terminated(separated(0.., json_value, (ws, ',', ws)), (ws, ']')),
+        terminated(separated(0.., json_value, (ws, ',', ws)), (ws, opt(','), ws, ']')),
     )
     .context(StrContext::Expected("array".into()))
     .parse_next(input)
@@ -173,9 +171,10 @@ fn array<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>>(
 fn object<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>>(
     input: &mut Stream<'i>,
 ) -> Result<HashMap<String, JsonValue>, E> {
-    preceded(
+    delimited(
         ('{', ws),
-        terminated(separated(0.., key_value, (ws, ',', ws)), (ws, '}')),
+        separated(0.., key_value, (ws, ',', ws)),
+        (ws, opt(','), ws, '}'),
     )
     .context(StrContext::Expected("object".into()))
     .parse_next(input)
@@ -184,19 +183,27 @@ fn object<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>>(
 fn key_value<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>>(
     input: &mut Stream<'i>,
 ) -> Result<(String, JsonValue), E> {
-    separated_pair(string, (ws, ':', ws), json_value).parse_next(input)
+    separated_pair(alt((string, key)), (ws, ':', ws), json_value).parse_next(input)
 }
 
-/// Parser combinators are constructed from the bottom up:
-/// first we write parsers for the smallest elements (here a space character),
-/// then we'll combine them in larger parsers
+fn key<'i, E: ParserError<Stream<'i>> + AddContext<Stream<'i>, StrContext>>(
+    input: &mut Stream<'i>,
+) -> Result<String, E> {
+    repeat(0.., one_of(AsChar::is_alphanum)).fold(String::new, |mut string, c| {
+        string.push(c);
+        string
+    })
+    .context(StrContext::Expected("string".into()))
+    .parse_next(input)
+}
+
 fn ws<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> Result<&'i str, E> {
-    // Combinators like `take_while` return a function. That function is the
-    // parser,to which we can pass the input
-    take_while(0.., WS).parse_next(input)
+    (multispace0, repeat(0.., (comment, multispace0)).map(|()| ())).take().parse_next(input) // TODO: allow multiple consecutive comments with or without intervening whitespace
 }
 
-const WS: &[char] = &[' ', '\t', '\r', '\n'];
+fn comment<'i, E: ParserError<Stream<'i>>>(input: &mut Stream<'i>) -> Result<&'i str, E> {
+    ('#', till_line_ending).take().parse_next(input)
+}
 
 #[cfg(test)]
 mod test {
@@ -253,6 +260,24 @@ mod test {
     }
 
     #[test]
+    fn json_object_trailing_comma() {
+        use JsonValue::{Num, Object, Str};
+
+        let input = r#"{"a":42,"b":"x",},"#;
+
+        let expected = Object(
+            vec![
+                ("a".to_owned(), Num(42.0)),
+                ("b".to_owned(), Str("x".to_owned())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        assert_eq!(json::<Error>.parse_peek(input), Ok(("", expected)));
+    }
+
+    #[test]
     fn json_array() {
         use JsonValue::{Array, Num, Str};
 
@@ -264,21 +289,38 @@ mod test {
     }
 
     #[test]
+    fn json_array_trailing_comma() {
+        use JsonValue::{Array, Num, Str};
+
+        let input = r#"[42,"x",]"#;
+
+        let expected = Array(vec![Num(42.0), Str("x".to_owned())]);
+
+        assert_eq!(json::<Error>.parse_peek(input), Ok(("", expected)));
+    }
+
+    #[test]
     fn json_whitespace() {
         use JsonValue::{Array, Boolean, Null, Num, Object, Str};
 
         let input = r#"
+        #
+#
   {
-    "null" : null,
+    "null" : null, # asdasd asdasd
     "true"  :true ,
+    #asdasdasd
     "false":  false  ,
     "number" : 123e4 ,
+#asdasdasdasdasd
     "string" : " abc 123 " ,
     "array" : [ false , 1 , "two" ] ,
     "object" : { "a" : 1.0 , "b" : "c" } ,
-    "empty_array" : [  ] ,
+    "empty_array" : [  ] , ####
+    ## ## ## asdasdasd #@ /asf\asd
     "empty_object" : {   }
   }
+  #####
   "#;
 
         assert_eq!(
